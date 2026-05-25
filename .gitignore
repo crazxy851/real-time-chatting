@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Logs and database
+*.log
+*.sqlite3
+
+# Uploads
+/uploads/
+
+# Node
+/node_modules/
+/npm-debug.log*
+/yarn-error.log*
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
