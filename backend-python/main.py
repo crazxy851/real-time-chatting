@@ -1,7 +1,6 @@
 """
-ChatSphere - Python FastAPI Backend
-Real-time WebSocket Chat Application
-Handles: WebSockets, REST API, File Uploads, Message Storage
+ChatSphere - Premium Python FastAPI Backend 
+Features: Persistent SQLite, Global WebSockets, DMs, Groups, Media Uploads, Message Deletion, View-Once Popups
 """
 
 import asyncio
@@ -10,28 +9,22 @@ import os
 import uuid
 import hashlib
 import mimetypes
-from datetime import datetime, timedelta
+import aiofiles
+import aiosqlite
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 from pathlib import Path
 
 from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect,
-    HTTPException, UploadFile, File, Form, Depends, status
+    HTTPException, UploadFile, File, Form, Depends
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 import uvicorn
 
-# ─────────────────────────────────────────
-#  App Configuration
-# ─────────────────────────────────────────
-app = FastAPI(
-    title="ChatSphere API",
-    description="Real-time collaboration & chat platform",
-    version="1.0.0"
-)
+app = FastAPI(title="ChatSphere Nexus")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,429 +34,368 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure directories exist
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# ─────────────────────────────────────────
-#  In-Memory Data Store (scalable to Redis)
-# ─────────────────────────────────────────
-users_db: Dict[str, dict] = {}          # user_id -> user info
-rooms_db: Dict[str, dict] = {}          # room_id -> room info
-messages_db: Dict[str, List[dict]] = {} # room_id -> [messages]
-typing_status: Dict[str, Set[str]] = {} # room_id -> {user_ids typing}
-online_users: Set[str] = set()
-
-# Pre-create default rooms
-DEFAULT_ROOMS = [
-    {"id": "general", "name": "# general", "type": "group", "description": "General discussions"},
-    {"id": "random",  "name": "# random",  "type": "group", "description": "Random chats"},
-    {"id": "dev",     "name": "# dev",     "type": "group", "description": "Developer talk"},
-]
-for r in DEFAULT_ROOMS:
-    rooms_db[r["id"]] = {**r, "members": [], "created_at": datetime.utcnow().isoformat()}
-    messages_db[r["id"]] = []
+DB_PATH = "chatsphere.db"
 
 # ─────────────────────────────────────────
-#  Pydantic Models
+#  Database Initialization
 # ─────────────────────────────────────────
-class UserRegister(BaseModel):
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT,
+                display_name TEXT, avatar_url TEXT, bio TEXT, token TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rooms (
+                id TEXT PRIMARY KEY, name TEXT, is_dm BOOLEAN, created_at TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS room_members (
+                room_id TEXT, user_id TEXT, PRIMARY KEY(room_id, user_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY, room_id TEXT, sender_id TEXT, content TEXT,
+                message_type TEXT, is_view_once BOOLEAN, is_viewed BOOLEAN,
+                file_url TEXT, file_name TEXT, timestamp TEXT
+            )
+        """)
+        await db.commit()
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+async def get_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
+
+# ─────────────────────────────────────────
+#  Models & Global Connection Manager
+# ─────────────────────────────────────────
+class UserAuth(BaseModel):
     username: str
     password: str
     display_name: Optional[str] = None
-    avatar_color: Optional[str] = "#6366f1"
 
-class UserLogin(BaseModel):
-    username: str
-    password: str
+class ProfileUpdate(BaseModel):
+    display_name: str
+    bio: str
+    avatar_url: str
 
-class MessageCreate(BaseModel):
-    room_id: str
-    content: str
-    message_type: str = "text"  # text | emoji | file | image
-    reply_to: Optional[str] = None
-
-class RoomCreate(BaseModel):
+class GroupCreate(BaseModel):
     name: str
-    description: Optional[str] = ""
-    members: Optional[List[str]] = []
+    member_ids: List[str]
 
-# ─────────────────────────────────────────
-#  Connection Manager (WebSocket Hub)
-# ─────────────────────────────────────────
+class DMCreate(BaseModel):
+    target_user_id: str
+
+def hash_pass(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
 class ConnectionManager:
     def __init__(self):
-        # room_id -> {user_id: WebSocket}
-        self.room_connections: Dict[str, Dict[str, WebSocket]] = {}
-        # user_id -> WebSocket (for direct notifications)
-        self.user_connections: Dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket, user_id: str, room_id: str):
+    async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
-        if room_id not in self.room_connections:
-            self.room_connections[room_id] = {}
-        self.room_connections[room_id][user_id] = websocket
-        self.user_connections[user_id] = websocket
-        online_users.add(user_id)
+        self.active_connections[user_id] = websocket
 
-    def disconnect(self, user_id: str, room_id: str):
-        if room_id in self.room_connections:
-            self.room_connections[room_id].pop(user_id, None)
-        self.user_connections.pop(user_id, None)
-        online_users.discard(user_id)
-        # Remove from typing
-        if room_id in typing_status:
-            typing_status[room_id].discard(user_id)
-
-    async def broadcast_to_room(self, room_id: str, message: dict, exclude: str = None):
-        """Broadcast to all connections in a room."""
-        if room_id not in self.room_connections:
-            return
-        dead = []
-        for uid, ws in self.room_connections[room_id].items():
-            if uid == exclude:
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception:
-                dead.append(uid)
-        for uid in dead:
-            self.room_connections[room_id].pop(uid, None)
+    def disconnect(self, user_id: str):
+        self.active_connections.pop(user_id, None)
 
     async def send_to_user(self, user_id: str, message: dict):
-        """Send directly to a specific user."""
-        ws = self.user_connections.get(user_id)
+        ws = self.active_connections.get(user_id)
         if ws:
             try:
                 await ws.send_json(message)
-            except Exception:
-                self.user_connections.pop(user_id, None)
-
-    async def broadcast_online_status(self, user_id: str, is_online: bool):
-        """Notify everyone of presence change."""
-        msg = {"type": "presence", "user_id": user_id, "online": is_online, "timestamp": datetime.utcnow().isoformat()}
-        for ws in list(self.user_connections.values()):
-            try:
-                await ws.send_json(msg)
-            except Exception:
-                pass
-
-    def get_room_count(self, room_id: str) -> int:
-        return len(self.room_connections.get(room_id, {}))
-
-    def total_connections(self) -> int:
-        return sum(len(v) for v in self.room_connections.values())
+            except:
+                self.disconnect(user_id)
 
 manager = ConnectionManager()
 
 # ─────────────────────────────────────────
-#  Helper Functions
-# ─────────────────────────────────────────
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def make_token(user_id: str) -> str:
-    return hashlib.sha256(f"{user_id}{datetime.utcnow()}".encode()).hexdigest()[:32]
-
-def get_user_by_token(token: str) -> Optional[dict]:
-    for u in users_db.values():
-        if u.get("token") == token:
-            return u
-    return None
-
-def format_message(msg: dict, users: dict) -> dict:
-    sender = users.get(msg["sender_id"], {})
-    return {
-        **msg,
-        "sender_name": sender.get("display_name", "Unknown"),
-        "sender_color": sender.get("avatar_color", "#6366f1"),
-        "sender_avatar": sender.get("avatar_color", "#6366f1"),
-    }
-
-# ─────────────────────────────────────────
-#  Auth Routes
+#  REST API Routes
 # ─────────────────────────────────────────
 @app.post("/api/auth/register")
-async def register(data: UserRegister):
-    if any(u["username"] == data.username for u in users_db.values()):
-        raise HTTPException(400, "Username already taken")
+async def register(data: UserAuth, db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("SELECT id FROM users WHERE username = ?", (data.username,))
+    if await cursor.fetchone(): raise HTTPException(400, "Username taken")
+    
     user_id = str(uuid.uuid4())
-    token = make_token(user_id)
-    user = {
-        "id": user_id,
-        "username": data.username,
-        "display_name": data.display_name or data.username,
-        "password_hash": hash_password(data.password),
-        "avatar_color": data.avatar_color,
-        "token": token,
-        "created_at": datetime.utcnow().isoformat(),
-        "status": "Hey there! I am using ChatSphere.",
-        "rooms": ["general"],
-    }
-    users_db[user_id] = user
-    # Auto-join general room
-    rooms_db["general"]["members"].append(user_id)
-    return {"token": token, "user": {k: v for k, v in user.items() if k != "password_hash"}}
+    token = uuid.uuid4().hex
+    await db.execute(
+        "INSERT INTO users (id, username, password_hash, display_name, avatar_url, bio, token) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, data.username, hash_pass(data.password), data.display_name or data.username, "", "Available", token)
+    )
+    await db.commit()
+    return {"token": token, "user": {"id": user_id, "username": data.username, "display_name": data.display_name, "avatar_url": "", "bio": "Available"}}
 
 @app.post("/api/auth/login")
-async def login(data: UserLogin):
-    user = next((u for u in users_db.values() if u["username"] == data.username), None)
-    if not user or user["password_hash"] != hash_password(data.password):
-        raise HTTPException(401, "Invalid credentials")
-    token = make_token(user["id"])
-    users_db[user["id"]]["token"] = token
-    return {"token": token, "user": {k: v for k, v in user.items() if k != "password_hash"}}
+async def login(data: UserAuth, db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("SELECT id, username, display_name, avatar_url, bio FROM users WHERE username = ? AND password_hash = ?", (data.username, hash_pass(data.password)))
+    row = await cursor.fetchone()
+    if not row: raise HTTPException(401, "Invalid credentials")
+    
+    token = uuid.uuid4().hex
+    await db.execute("UPDATE users SET token = ? WHERE id = ?", (token, row['id']))
+    await db.commit()
+    return {"token": token, "user": dict(row)}
 
-# ─────────────────────────────────────────
-#  User Routes
-# ─────────────────────────────────────────
 @app.get("/api/users")
-async def get_users():
-    return [
-        {k: v for k, v in u.items() if k not in ("password_hash", "token")}
-        for u in users_db.values()
-    ]
+async def get_users(db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("SELECT id, username, display_name, avatar_url, bio FROM users")
+    return [dict(r) for r in await cursor.fetchall()]
 
-@app.get("/api/users/online")
-async def get_online_users():
-    return {"online": list(online_users), "count": len(online_users)}
+@app.put("/api/users/{user_id}")
+async def update_profile(user_id: str, data: ProfileUpdate, db: aiosqlite.Connection = Depends(get_db)):
+    await db.execute("UPDATE users SET display_name = ?, bio = ?, avatar_url = ? WHERE id = ?", 
+                    (data.display_name, data.bio, data.avatar_url, user_id))
+    await db.commit()
+    return {"status": "success"}
 
-# ─────────────────────────────────────────
-#  Room Routes
-# ─────────────────────────────────────────
-@app.get("/api/rooms")
-async def get_rooms():
-    return list(rooms_db.values())
+@app.delete("/api/users/{user_id}")
+async def delete_account(user_id: str, db: aiosqlite.Connection = Depends(get_db)):
+    await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    await db.execute("DELETE FROM room_members WHERE user_id = ?", (user_id,))
+    await db.commit()
+    return {"status": "deleted"}
 
-@app.post("/api/rooms")
-async def create_room(data: RoomCreate):
-    room_id = str(uuid.uuid4())[:8]
-    room = {
-        "id": room_id,
-        "name": f"# {data.name.lower().replace(' ', '-')}",
-        "type": "group",
-        "description": data.description,
-        "members": data.members,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    rooms_db[room_id] = room
-    messages_db[room_id] = []
-    return room
+@app.get("/api/rooms/{user_id}")
+async def get_rooms(user_id: str, db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("""
+        SELECT r.id, r.name, r.is_dm 
+        FROM rooms r 
+        JOIN room_members rm ON r.id = rm.room_id 
+        WHERE rm.user_id = ?
+        ORDER BY r.created_at DESC
+    """, (user_id,))
+    rooms = [dict(r) for r in await cursor.fetchall()]
+    
+    for r in rooms:
+        if r['is_dm']:
+            c2 = await db.execute("""
+                SELECT u.display_name FROM users u 
+                JOIN room_members rm ON u.id = rm.user_id 
+                WHERE rm.room_id = ? AND u.id != ?
+            """, (r['id'], user_id))
+            other = await c2.fetchone()
+            if other: r['name'] = other['display_name']
+    return rooms
 
-@app.post("/api/rooms/{room_id}/join")
-async def join_room(room_id: str, user_id: str = Form(...)):
-    if room_id not in rooms_db:
-        raise HTTPException(404, "Room not found")
-    if user_id not in rooms_db[room_id]["members"]:
-        rooms_db[room_id]["members"].append(user_id)
-    if user_id in users_db and room_id not in users_db[user_id].get("rooms", []):
-        users_db[user_id].setdefault("rooms", []).append(room_id)
-    return {"joined": True}
+@app.post("/api/rooms/dm/{user_id}")
+async def create_dm(user_id: str, data: DMCreate, db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("""
+        SELECT rm1.room_id FROM room_members rm1
+        JOIN room_members rm2 ON rm1.room_id = rm2.room_id
+        JOIN rooms r ON r.id = rm1.room_id
+        WHERE r.is_dm = 1 AND rm1.user_id = ? AND rm2.user_id = ?
+    """, (user_id, data.target_user_id))
+    existing = await cursor.fetchone()
+    if existing: return {"id": existing['room_id']}
 
-# ─────────────────────────────────────────
-#  Message Routes
-# ─────────────────────────────────────────
+    room_id = str(uuid.uuid4())
+    await db.execute("INSERT INTO rooms (id, name, is_dm, created_at) VALUES (?, '', 1, ?)", (room_id, datetime.utcnow().isoformat()))
+    await db.execute("INSERT INTO room_members (room_id, user_id) VALUES (?, ?)", (room_id, user_id))
+    await db.execute("INSERT INTO room_members (room_id, user_id) VALUES (?, ?)", (room_id, data.target_user_id))
+    await db.commit()
+    return {"id": room_id}
+
+@app.post("/api/rooms/group/{user_id}")
+async def create_group(user_id: str, data: GroupCreate, db: aiosqlite.Connection = Depends(get_db)):
+    room_id = str(uuid.uuid4())
+    await db.execute("INSERT INTO rooms (id, name, is_dm, created_at) VALUES (?, ?, 0, ?)", (room_id, data.name, datetime.utcnow().isoformat()))
+    
+    members = set(data.member_ids)
+    members.add(user_id)
+    for m_id in members:
+        await db.execute("INSERT INTO room_members (room_id, user_id) VALUES (?, ?)", (room_id, m_id))
+    await db.commit()
+    return {"id": room_id}
+
 @app.get("/api/messages/{room_id}")
-async def get_messages(room_id: str, limit: int = 50, offset: int = 0):
-    msgs = messages_db.get(room_id, [])
-    sliced = msgs[-(limit + offset):][:limit] if offset == 0 else msgs[offset:offset + limit]
-    return [format_message(m, users_db) for m in sliced]
-
-@app.post("/api/messages")
-async def post_message(data: MessageCreate):
-    msg_id = str(uuid.uuid4())
-    msg = {
-        "id": msg_id,
-        "room_id": data.room_id,
-        "sender_id": "api_user",
-        "content": data.content,
-        "message_type": data.message_type,
-        "reply_to": data.reply_to,
-        "reactions": {},
-        "timestamp": datetime.utcnow().isoformat(),
-        "edited": False,
-    }
-    messages_db.setdefault(data.room_id, []).append(msg)
-    # Broadcast via WebSocket
-    await manager.broadcast_to_room(data.room_id, {"type": "new_message", "message": format_message(msg, users_db)})
-    return msg
+async def get_messages(room_id: str, db: aiosqlite.Connection = Depends(get_db)):
+    cursor = await db.execute("""
+        SELECT m.*, u.display_name as sender_name, u.avatar_url as sender_avatar 
+        FROM messages m 
+        LEFT JOIN users u ON m.sender_id = u.id 
+        WHERE m.room_id = ? AND (m.is_view_once = 0 OR m.is_viewed = 0)
+        ORDER BY m.timestamp ASC LIMIT 100
+    """, (room_id,))
+    
+    msgs = [dict(r) for r in await cursor.fetchall()]
+    for m in msgs:
+        if m['sender_name'] is None and m['sender_id'] != 'api':
+            m['sender_name'] = "Deleted User"
+            m['sender_avatar'] = ""
+    return msgs
 
 # ─────────────────────────────────────────
-#  File Upload Route
+#  File Uploads (Media & Avatars)
 # ─────────────────────────────────────────
 @app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    room_id: str = Form(...),
-    sender_id: str = Form(...),
-):
-    MAX_SIZE = 25 * 1024 * 1024  # 25 MB
-    content = await file.read()
-    if len(content) > MAX_SIZE:
-        raise HTTPException(413, "File too large (max 25MB)")
-
+async def upload_media(room_id: str = Form(...), user_id: str = Form(...), is_view_once: bool = Form(False), file: UploadFile = File(...), db: aiosqlite.Connection = Depends(get_db)):
+    MAX_SIZE = 25 * 1024 * 1024
     ext = Path(file.filename).suffix.lower()
-    file_id = f"{uuid.uuid4().hex}{ext}"
+    file_id = f"media_{uuid.uuid4().hex}{ext}"
     save_path = UPLOAD_DIR / file_id
-    save_path.write_bytes(content)
+    
+    file_size = 0
+    async with aiofiles.open(save_path, 'wb') as out_file:
+        while content := await file.read(1024 * 1024):
+            file_size += len(content)
+            if file_size > MAX_SIZE:
+                save_path.unlink(missing_ok=True)
+                raise HTTPException(413, "File too large")
+            await out_file.write(content)
 
     mime = mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
-    is_image = mime.startswith("image/")
-    msg_type = "image" if is_image else "file"
-
-    msg = {
-        "id": str(uuid.uuid4()),
-        "room_id": room_id,
-        "sender_id": sender_id,
-        "content": file.filename,
-        "message_type": msg_type,
-        "file_url": f"/uploads/{file_id}",
-        "file_name": file.filename,
-        "file_size": len(content),
-        "mime_type": mime,
-        "reactions": {},
-        "timestamp": datetime.utcnow().isoformat(),
-        "edited": False,
+    msg_type = "image" if mime.startswith("image/") else "file"
+    file_url = f"/uploads/{file_id}"
+    
+    msg_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    
+    await db.execute("""
+        INSERT INTO messages (id, room_id, sender_id, content, message_type, is_view_once, is_viewed, file_url, file_name, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+    """, (msg_id, room_id, user_id, file.filename, msg_type, is_view_once, file_url, file.filename, now))
+    await db.commit()
+    
+    c_user = await db.execute("SELECT display_name, avatar_url FROM users WHERE id = ?", (user_id,))
+    user_info = dict(await c_user.fetchone() or {})
+    
+    c_room = await db.execute("SELECT name, is_dm FROM rooms WHERE id = ?", (room_id,))
+    room_info = await c_room.fetchone()
+    
+    broadcast_msg = {
+        "type": "new_message",
+        "message": {
+            "id": msg_id, "room_id": room_id, "sender_id": user_id,
+            "content": file.filename, "message_type": msg_type,
+            "file_url": file_url, "file_name": file.filename,
+            "is_view_once": is_view_once, "sender_name": user_info.get("display_name"),
+            "sender_avatar": user_info.get("avatar_url"),
+            "room_name": room_info['name'] if room_info else "Chat", "is_dm": room_info['is_dm'] if room_info else False
+        }
     }
-    messages_db.setdefault(room_id, []).append(msg)
-    await manager.broadcast_to_room(room_id, {"type": "new_message", "message": format_message(msg, users_db)})
-    return msg
+    
+    c_mem = await db.execute("SELECT user_id FROM room_members WHERE room_id = ?", (room_id,))
+    for m in await c_mem.fetchall():
+        target_id = m['user_id']
+        if room_info and room_info['is_dm'] and target_id != user_id:
+            broadcast_msg["message"]["room_name"] = user_info.get("display_name")
+        await manager.send_to_user(target_id, broadcast_msg)
+        
+    return {"status": "success"}
+
+@app.post("/api/profile/avatar")
+async def upload_avatar(user_id: str = Form(...), file: UploadFile = File(...), db: aiosqlite.Connection = Depends(get_db)):
+    ext = Path(file.filename).suffix.lower()
+    file_id = f"avatar_{uuid.uuid4().hex}{ext}"
+    save_path = UPLOAD_DIR / file_id
+    
+    async with aiofiles.open(save_path, 'wb') as out_file:
+        while content := await file.read(1024 * 1024):
+            await out_file.write(content)
+            
+    avatar_url = f"/uploads/{file_id}"
+    await db.execute("UPDATE users SET avatar_url = ? WHERE id = ?", (avatar_url, user_id))
+    await db.commit()
+    return {"avatar_url": avatar_url}
 
 # ─────────────────────────────────────────
-#  Reaction Route
+#  Global WebSocket Endpoint
 # ─────────────────────────────────────────
-@app.post("/api/messages/{msg_id}/react")
-async def react_to_message(msg_id: str, emoji: str = Form(...), user_id: str = Form(...), room_id: str = Form(...)):
-    msgs = messages_db.get(room_id, [])
-    for msg in msgs:
-        if msg["id"] == msg_id:
-            if emoji not in msg["reactions"]:
-                msg["reactions"][emoji] = []
-            if user_id in msg["reactions"][emoji]:
-                msg["reactions"][emoji].remove(user_id)
-            else:
-                msg["reactions"][emoji].append(user_id)
-            await manager.broadcast_to_room(room_id, {
-                "type": "reaction_update",
-                "msg_id": msg_id,
-                "reactions": msg["reactions"]
-            })
-            return msg["reactions"]
-    raise HTTPException(404, "Message not found")
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await manager.connect(websocket, user_id)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        cursor = await db.execute("SELECT display_name, avatar_url FROM users WHERE id = ?", (user_id,))
+        user_info = dict(await cursor.fetchone() or {})
+        
+        try:
+            while True:
+                data = await websocket.receive_json()
+                event = data.get("type")
 
-# ─────────────────────────────────────────
-#  WebSocket Endpoint
-# ─────────────────────────────────────────
-@app.websocket("/ws/{room_id}/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
-    await manager.connect(websocket, user_id, room_id)
-    user = users_db.get(user_id, {})
+                if event == "message":
+                    room_id = data.get("room_id")
+                    content = data.get("content", "")
+                    is_vo = data.get("is_view_once", False)
+                    msg_id = str(uuid.uuid4())
+                    now = datetime.utcnow().isoformat()
+                    
+                    await db.execute("""
+                        INSERT INTO messages (id, room_id, sender_id, content, message_type, is_view_once, is_viewed, timestamp)
+                        VALUES (?, ?, ?, ?, 'text', ?, 0, ?)
+                    """, (msg_id, room_id, user_id, content, is_vo, now))
+                    await db.commit()
+                    
+                    c2 = await db.execute("SELECT name, is_dm FROM rooms WHERE id = ?", (room_id,))
+                    room_info = await c2.fetchone()
+                    
+                    c3 = await db.execute("SELECT user_id FROM room_members WHERE room_id = ?", (room_id,))
+                    members = await c3.fetchall()
+                    
+                    broadcast_msg = {
+                        "type": "new_message",
+                        "message": {
+                            "id": msg_id, "room_id": room_id, "sender_id": user_id,
+                            "content": content, "message_type": "text",
+                            "is_view_once": is_vo, "sender_name": user_info.get("display_name"),
+                            "sender_avatar": user_info.get("avatar_url"),
+                            "room_name": room_info['name'] if room_info else "Chat",
+                            "is_dm": room_info['is_dm'] if room_info else False
+                        }
+                    }
+                    
+                    for m in members:
+                        target_id = m['user_id']
+                        if room_info and room_info['is_dm'] and target_id != user_id:
+                            broadcast_msg["message"]["room_name"] = user_info.get("display_name")
+                        await manager.send_to_user(target_id, broadcast_msg)
+                        
+                elif event == "viewed_once":
+                    msg_id = data.get("msg_id")
+                    room_id = data.get("room_id")
+                    await db.execute("UPDATE messages SET is_viewed = 1 WHERE id = ?", (msg_id,))
+                    await db.commit()
+                    
+                    c3 = await db.execute("SELECT user_id FROM room_members WHERE room_id = ?", (room_id,))
+                    for m in await c3.fetchall():
+                        await manager.send_to_user(m['user_id'], {"type": "message_destroyed", "msg_id": msg_id, "room_id": room_id})
 
-    # Announce join
-    await manager.broadcast_to_room(room_id, {
-        "type": "user_joined",
-        "user_id": user_id,
-        "display_name": user.get("display_name", "Unknown"),
-        "timestamp": datetime.utcnow().isoformat(),
-    }, exclude=user_id)
-    await manager.broadcast_online_status(user_id, True)
+                elif event == "delete_message":
+                    msg_id = data.get("msg_id")
+                    room_id = data.get("room_id")
+                    
+                    # WhatsApp style: update record row info to show it's deleted instead of dropping completely
+                    await db.execute("""
+                        UPDATE messages 
+                        SET content = '🚫 This message was deleted', message_type = 'text', file_url = NULL, file_name = NULL 
+                        WHERE id = ?
+                    """, (msg_id,))
+                    await db.commit()
+                    
+                    c3 = await db.execute("SELECT user_id FROM room_members WHERE room_id = ?", (room_id,))
+                    for m in await c3.fetchall():
+                        await manager.send_to_user(m['user_id'], {"type": "message_deleted", "msg_id": msg_id, "room_id": room_id})
 
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            data = json.loads(raw)
-            event = data.get("type")
-
-            # ── CHAT MESSAGE ──────────────────────────
-            if event == "message":
-                msg = {
-                    "id": str(uuid.uuid4()),
-                    "room_id": room_id,
-                    "sender_id": user_id,
-                    "content": data.get("content", ""),
-                    "message_type": data.get("message_type", "text"),
-                    "reply_to": data.get("reply_to"),
-                    "reactions": {},
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "edited": False,
-                }
-                messages_db.setdefault(room_id, []).append(msg)
-                broadcast_msg = {
-                    "type": "new_message",
-                    "message": format_message(msg, users_db)
-                }
-                # Send to all INCLUDING sender (for multi-tab support)
-                await manager.broadcast_to_room(room_id, broadcast_msg)
-                # Push notification to offline/other-room users who are members
-                room = rooms_db.get(room_id, {})
-                for member_id in room.get("members", []):
-                    if member_id != user_id and member_id not in manager.room_connections.get(room_id, {}):
-                        await manager.send_to_user(member_id, {
-                            "type": "notification",
-                            "from": user.get("display_name", "Someone"),
-                            "room_id": room_id,
-                            "room_name": room.get("name", ""),
-                            "preview": data.get("content", "")[:60],
-                            "timestamp": datetime.utcnow().isoformat(),
-                        })
-
-            # ── TYPING INDICATOR ─────────────────────
-            elif event == "typing_start":
-                typing_status.setdefault(room_id, set()).add(user_id)
-                await manager.broadcast_to_room(room_id, {
-                    "type": "typing",
-                    "user_id": user_id,
-                    "display_name": user.get("display_name", ""),
-                    "is_typing": True,
-                }, exclude=user_id)
-
-            elif event == "typing_stop":
-                typing_status.get(room_id, set()).discard(user_id)
-                await manager.broadcast_to_room(room_id, {
-                    "type": "typing",
-                    "user_id": user_id,
-                    "is_typing": False,
-                }, exclude=user_id)
-
-            # ── READ RECEIPT ─────────────────────────
-            elif event == "read":
-                await manager.broadcast_to_room(room_id, {
-                    "type": "read_receipt",
-                    "user_id": user_id,
-                    "msg_id": data.get("msg_id"),
-                }, exclude=user_id)
-
-            # ── PING (keep-alive) ─────────────────────
-            elif event == "ping":
-                await websocket.send_json({"type": "pong"})
-
-    except WebSocketDisconnect:
-        manager.disconnect(user_id, room_id)
-        await manager.broadcast_to_room(room_id, {
-            "type": "user_left",
-            "user_id": user_id,
-            "display_name": user.get("display_name", "Unknown"),
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-        await manager.broadcast_online_status(user_id, False)
-
-# ─────────────────────────────────────────
-#  Health / Stats
-# ─────────────────────────────────────────
-@app.get("/api/health")
-async def health():
-    return {
-        "status": "ok",
-        "connections": manager.total_connections(),
-        "online_users": len(online_users),
-        "rooms": len(rooms_db),
-        "messages": sum(len(v) for v in messages_db.values()),
-    }
-
-@app.get("/")
-async def root():
-    return {"message": "ChatSphere API running!", "docs": "/docs"}
+        except WebSocketDisconnect:
+            manager.disconnect(user_id)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
