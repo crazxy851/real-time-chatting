@@ -1,32 +1,23 @@
-# ChatSphere
+# ChatSphere Premium
 
-Real-time chat application (FastAPI backend, Node SSE gateway, static frontend).
+A high-performance, real-time collaboration and chatting platform built with a dark spatial "Bento-Box" user interface design. ChatSphere features multiple user direct messaging, group creations, real-time WhatsApp-style message deletion, rich media/file attachments, profile bios, automated animated avatar generation, and custom popup view-once message destruction.
 
-Quick start (local):
+The architecture is highly optimized for performance and network stability by running entirely on a single Python FastAPI backend with persistent SQLite database tracking.
 
-1. Create and activate Python venv, install deps:
+## Key Features
+- **Persistent Local Database:** All user identities, room configurations, and chat histories are permanently saved in a local database (`chatsphere.db`).
+- **Direct Messaging & Group Frameworks:** Launch fluid DMs or spin up complex group chats using a user-focused global WebSocket pipeline.
+- **Rich Media Sharing:** Attach images and documents natively into chat rooms using the 📎 attachment mechanism.
+- **Secure View-Once Popups:** View-once messages safely launch within an isolated modal pop-up overlay window. Shutting the window fires an instantaneous server deletion query, completely wiping it from all displays.
+- **WhatsApp-Style Deletion:** Hover over any message you've sent and click 🗑️ to delete it for everyone across the entire network instantly.
+- **Profile Customization Suite:** Modify your display name, edit profile bios, upload local file photos, or compile animated avatar variants using the integrated generator.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+## Quick Start Launcher (Windows Deployment)
 
-2. Start services (or use the provided script):
+The project includes an automated single-click launcher that configures your virtual environment, installs required dependencies, and starts all services in the background.
 
-```powershell
-# from repo root
-powershell -ExecutionPolicy Bypass -File .\start-all.ps1
-```
-
-Services:
-- Python API: http://localhost:8000 (OpenAPI: /docs)
-- Node SSE: http://localhost:3001
-- Frontend: http://localhost:5500
-
-Files of interest:
-- `backend-python/main.py`
-- `backend-node/server.js`
-- `frontend/public/index.html`
-
-License: MIT
+1. Open your File Explorer or Command Prompt (CMD).
+2. Direct yourself into the project path directory: `D:\Real Time Chatting`
+3. Execute the custom launcher:
+   ```cmd
+   start-all.bat
