@@ -19,6 +19,7 @@ from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect,
     HTTPException, UploadFile, File, Form, Depends
 )
+from fastapi.responses import FileResponse  # <-- Added for serving frontend files
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -39,6 +40,27 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 DB_PATH = "chatsphere.db"
+
+# ─────────────────────────────────────────
+#  Root Router (Serves Frontend)
+# ─────────────────────────────────────────
+@app.get("/")
+async def serve_frontend():
+    """
+    Resilient path lookup to locate index.html on both local machines 
+    and remote production Linux containers (Render).
+    """
+    potential_paths = [
+        Path(__file__).resolve().parent.parent / "frontend" / "public" / "index.html",  # Repo root structure
+        Path("frontend/public/index.html"),                                             # Relative execution path
+        Path("index.html")                                                              # Root fallback
+    ]
+    
+    for path in potential_paths:
+        if path.exists():
+            return FileResponse(path)
+            
+    raise HTTPException(status_code=404, detail="Frontend index.html file not found.")
 
 # ─────────────────────────────────────────
 #  Database Initialization
