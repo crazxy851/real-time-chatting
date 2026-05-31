@@ -240,9 +240,14 @@
   </div>
 
 <script>
-const HOST = window.location.hostname || 'localhost';
-const API = `http://${HOST}:8000`;
-const WS_BASE = `ws://${HOST}:8000`;
+const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+
+const HOST = isLocal ? 'localhost:8000' : window.location.host;
+const PROTOCOL = window.location.protocol;
+const WS_PROTOCOL = PROTOCOL === 'https:' ? 'wss:' : 'ws:';
+
+const API = isLocal ? `http://${HOST}` : `${PROTOCOL}//${HOST}`;
+const WS_BASE = isLocal ? `ws://${HOST}` : `${WS_PROTOCOL}//${HOST}`;
 
 let user = null;
 let currentRoom = null;
