@@ -19,7 +19,7 @@ from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect,
     HTTPException, UploadFile, File, Form, Depends
 )
-from fastapi.responses import FileResponse  # <-- Added for serving frontend files
+from fastapi.responses import FileResponse  # <-- Crucial import
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -42,25 +42,17 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 DB_PATH = "chatsphere.db"
 
 # ─────────────────────────────────────────
-#  Root Router (Serves Frontend)
+#  Root Router (Serves Frontend interface)
 # ─────────────────────────────────────────
 @app.get("/")
 async def serve_frontend():
-    """
-    Resilient path lookup to locate index.html on both local machines 
-    and remote production Linux containers (Render).
-    """
-    potential_paths = [
-        Path(__file__).resolve().parent.parent / "frontend" / "public" / "index.html",  # Repo root structure
-        Path("frontend/public/index.html"),                                             # Relative execution path
-        Path("index.html")                                                              # Root fallback
-    ]
+    # Resolves paths explicitly across both Windows local machines and Linux web servers
+    base_dir = Path(__file__).resolve().parent.parent
+    frontend_path = base_dir / "frontend" / "public" / "index.html"
     
-    for path in potential_paths:
-        if path.exists():
-            return FileResponse(path)
-            
-    raise HTTPException(status_code=404, detail="Frontend index.html file not found.")
+    if frontend_path.exists():
+        return FileResponse(frontend_path)
+    raise HTTPException(status_code=404, detail="Frontend index.html file could not be found.")
 
 # ─────────────────────────────────────────
 #  Database Initialization
@@ -404,7 +396,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     msg_id = data.get("msg_id")
                     room_id = data.get("room_id")
                     
-                    # WhatsApp style: update record row info to show it's deleted instead of dropping completely
+                    # WhatsApp style updates
                     await db.execute("""
                         UPDATE messages 
                         SET content = '🚫 This message was deleted', message_type = 'text', file_url = NULL, file_name = NULL 
